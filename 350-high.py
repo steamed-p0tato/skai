@@ -2,12 +2,12 @@
 """
 Pre-train a foundational language model FROM SCRATCH on FineWeb-Edu.
 Random weight initialization — no pretrained weights loaded.
-Optimized for 8 GB VRAM with gradient checkpointing + mixed precision.
+Optimized for 24 GB VRAM + 64 GB RAM with gradient checkpointing + mixed precision.
 
 v3 improvements:
   1. Dataset: FineWeb-Edu (streaming) for true pre-training (common sense).
   2. Architecture: Grouped-Query Attention (GQA) & Sliding Window Attention (SWA).
-  3. Context Length: 4096 (trained on 2048 packed chunks).
+  3. Context Length: 4096 (trained on 4096 packed chunks).
   4. Sequence packing with explicit BOS/EOS document boundaries.
 """
 
@@ -51,7 +51,7 @@ class TrainingConfig:
     num_attention_heads: int = 16
     num_key_value_heads: int = 4          # GQA: 4 KV heads for 16 Q heads
     intermediate_size: int = 2816         # SwiGLU sweet spot
-    max_position_embeddings: int = 4096   # Increased max context
+    max_position_embeddings: int = 4096   
     sliding_window: int = 512             # SWA: Attend to 512 local tokens
     rms_norm_eps: float = 1e-5
     tie_word_embeddings: bool = True
@@ -65,20 +65,20 @@ class TrainingConfig:
     dataset_subset: str = "sample-10BT"
 
     # ── training ─────────────────────────────────────────────────
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 16   # eff batch = 2×16×2048 = 65 K tok
+    batch_size: int = 8                     # Increased for 24GB VRAM
+    gradient_accumulation_steps: int = 8    # eff batch = 8×8×4096 = ~262 K tok
     learning_rate: float = 3e-4             # Lower LR for stable pre-training
     min_learning_rate: float = 1e-5
     weight_decay: float = 0.1
     max_grad_norm: float = 1.0
-    warmup_steps: int = 1000                # Longer warmup to stabilize random weights
-    num_epochs: int = 1                     # 1 epoch is standard for massive datasets
+    warmup_steps: int = 1000                
+    num_epochs: int = 3                     # Updated to 3 epochs
     max_steps: int = -1
 
-    max_seq_length: int = 2048              
+    max_seq_length: int = 4096              # Maximize context length for 24GB VRAM
 
     # ── efficiency ───────────────────────────────────────────────
-    use_flash_attention: bool = False       # Set to True if you install flash-attn
+    use_flash_attention: bool = True        # Required for 4k context + large batch on 24GB
     use_gradient_checkpointing: bool = True
     use_mixed_precision: bool = True
 
@@ -102,15 +102,14 @@ class FineWebPackedDataset(Dataset):
         tokenizer,
         dataset_name: str,
         dataset_subset: str,
-        max_length: int = 2048,
+        max_length: int = 4096,
         split: str = "train",
-        max_samples: int = 100000,
+        max_samples: int = 1_000_000,
         skip_samples: int = 0
     ):
         print(f"\nLoading {dataset_name} ({dataset_subset}) via streaming...")
         self.max_length = max_length
 
-        # Streaming avoids downloading the entire 10BT dataset to disk
         ds = load_dataset(
             dataset_name, 
             name=dataset_subset, 
@@ -176,8 +175,8 @@ class FineWebPackedDataset(Dataset):
         input_ids = self.chunks[idx]
         return {
             "input_ids": input_ids,
-            "labels": input_ids.clone(),             # model shifts internally
-            "attention_mask": torch.ones_like(input_ids), # no padding!
+            "labels": input_ids.clone(),             
+            "attention_mask": torch.ones_like(input_ids), 
         }
 
 
@@ -212,7 +211,6 @@ def create_model(config: TrainingConfig, vocab_size: int):
     print(f"  Vocab        : {vocab_size}")
     print(f"  Max position : {config.max_position_embeddings}")
 
-    # Use PyTorch's native Scaled Dot-Product Attention if Flash is off
     attn_impl = "flash_attention_2" if config.use_flash_attention else "sdpa"
     dtype = torch.bfloat16 if config.use_mixed_precision else torch.float32
 
@@ -248,13 +246,6 @@ def create_model(config: TrainingConfig, vocab_size: int):
     t = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n  Total params     : {n:>12,}  ({n/1e6:.1f} M)")
     print(f"  Trainable params : {t:>12,}  ({t/1e6:.1f} M)")
-
-    param_mb = n * 2 / 1e6          
-    optim_mb = n * 2 * 2 / 1e6      
-    grad_mb = n * 2 / 1e6
-    static_mb = param_mb + optim_mb + grad_mb
-    print(f"\n  Est. static VRAM : {static_mb:.0f} MB "
-          f"(params {param_mb:.0f} + optim {optim_mb:.0f} + grad {grad_mb:.0f})")
 
     return model
 
@@ -466,9 +457,9 @@ def main(max_samples: int = None, config_path: str = None):
     # ── Packed Datasets ──────────────────────────────────────────
     print("\n=== Datasets (streaming, packed, zero padding) ===")
     
-    # Defaults to 100,000 documents to fit comfortably in standard RAM while packing. 
-    # Increase this if you have 32GB+ system RAM.
-    train_samples = max_samples if max_samples else 100_000 
+    # 64GB RAM allows us to hold significantly more data in memory.
+    # 1,000,000 documents is an excellent target to pre-load for robust training epochs.
+    train_samples = max_samples if max_samples else 1_000_000 
     eval_samples = max(1, train_samples // 10)
 
     train_ds = FineWebPackedDataset(
@@ -481,8 +472,9 @@ def main(max_samples: int = None, config_path: str = None):
         config.max_seq_length, split="train", max_samples=eval_samples, skip_samples=train_samples
     )
 
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    eval_loader = DataLoader(eval_ds, batch_size=config.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    # Utilizing multiple workers since you have abundant system RAM
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    eval_loader = DataLoader(eval_ds, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     # ── Model (FROM SCRATCH) ─────────────────────────────────────
     print("\n=== Model ===")
@@ -558,10 +550,10 @@ def main(max_samples: int = None, config_path: str = None):
 
 if __name__ == "__main__":
     if "ipykernel" in sys.modules:
-        main(max_samples=100_000, config_path=None)
+        main(max_samples=1_000_000, config_path=None)
     else:
         parser = argparse.ArgumentParser(description="Pre-train ~350M LM on FineWeb-Edu")
         parser.add_argument("--config", type=str, default=None)
-        parser.add_argument("--max-samples", type=int, default=100_000, help="Cap fetched documents to prevent OOM")
+        parser.add_argument("--max-samples", type=int, default=1_000_000, help="Cap fetched documents to prevent OOM")
         cli_args = parser.parse_args()
         main(max_samples=cli_args.max_samples, config_path=cli_args.config)
