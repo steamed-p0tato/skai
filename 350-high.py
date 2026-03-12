@@ -2,7 +2,7 @@
 """
 Pre-train a foundational language model FROM SCRATCH on FineWeb-Edu.
 Random weight initialization — no pretrained weights loaded.
-Optimized for 24 GB VRAM + 64 GB RAM with gradient checkpointing + mixed precision.
+Optimized for 24 GB VRAM + 64 GB RAM using PyTorch Native SDPA (No Flash Attention).
 
 v3 improvements:
   1. Dataset: FineWeb-Edu (streaming) for true pre-training (common sense).
@@ -65,20 +65,20 @@ class TrainingConfig:
     dataset_subset: str = "sample-10BT"
 
     # ── training ─────────────────────────────────────────────────
-    batch_size: int = 8                     # Increased for 24GB VRAM
-    gradient_accumulation_steps: int = 8    # eff batch = 8×8×4096 = ~262 K tok
-    learning_rate: float = 3e-4             # Lower LR for stable pre-training
+    batch_size: int = 4                     # Reduced to 4 to accommodate SDPA overhead on 24GB
+    gradient_accumulation_steps: int = 16   # Increased to maintain effective batch size
+    learning_rate: float = 3e-4             
     min_learning_rate: float = 1e-5
     weight_decay: float = 0.1
     max_grad_norm: float = 1.0
     warmup_steps: int = 1000                
-    num_epochs: int = 3                     # Updated to 3 epochs
+    num_epochs: int = 3                     
     max_steps: int = -1
 
-    max_seq_length: int = 4096              # Maximize context length for 24GB VRAM
+    max_seq_length: int = 4096              
 
     # ── efficiency ───────────────────────────────────────────────
-    use_flash_attention: bool = True        # Required for 4k context + large batch on 24GB
+    use_flash_attention: bool = False       # Disabled Flash Attention
     use_gradient_checkpointing: bool = True
     use_mixed_precision: bool = True
 
@@ -457,8 +457,6 @@ def main(max_samples: int = None, config_path: str = None):
     # ── Packed Datasets ──────────────────────────────────────────
     print("\n=== Datasets (streaming, packed, zero padding) ===")
     
-    # 64GB RAM allows us to hold significantly more data in memory.
-    # 1,000,000 documents is an excellent target to pre-load for robust training epochs.
     train_samples = max_samples if max_samples else 1_000_000 
     eval_samples = max(1, train_samples // 10)
 
@@ -472,7 +470,6 @@ def main(max_samples: int = None, config_path: str = None):
         config.max_seq_length, split="train", max_samples=eval_samples, skip_samples=train_samples
     )
 
-    # Utilizing multiple workers since you have abundant system RAM
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     eval_loader = DataLoader(eval_ds, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
